@@ -8,10 +8,22 @@ echo "=========================================================="
 echo "    Harry Translate (哈利同传) 双桌面悬浮同传 HUD (双窗并存)  "
 echo "=========================================================="
 
-# 智能检测与激活 Python 运行环境 (本地 .venv 优先，自动初始化/系统环境兜底)
+# 智能检测与激活 Python 运行环境 (.venv 优先，自动初始化/系统环境兜底)
 PYTHON=""
 if [ -f ".venv/bin/python" ]; then
     PYTHON=".venv/bin/python"
+<<<<<<< HEAD
+=======
+    if ! $PYTHON -c "import fastapi, uvicorn, webview, pyaudio" >/dev/null 2>&1; then
+        echo ">> [检测] 虚拟环境缺少必要依赖，正在自动为您安装..."
+        if ! $PYTHON -m pip install -r requirements.txt; then
+            if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+                echo ">> [自愈] 检测到 PyAudio 底层依赖缺失，正在通过 Homebrew 自动安装 portaudio..."
+                brew install portaudio && $PYTHON -m pip install -r requirements.txt
+            fi
+        fi
+    fi
+>>>>>>> origin/main
 elif command -v python3 >/dev/null 2>&1; then
     if python3 -c "import fastapi, uvicorn, pywebview, pyaudio" >/dev/null 2>&1; then
         echo ">> [提示] 未发现 .venv，但系统 Python3 依赖完备，使用系统 Python3..."
@@ -20,7 +32,12 @@ elif command -v python3 >/dev/null 2>&1; then
         echo ">> [初始化] 未检测到 .venv 虚拟环境，正在为您自动创建并安装依赖..."
         python3 -m venv .venv
         if [ -f ".venv/bin/python" ]; then
-            .venv/bin/pip install -r requirements.txt
+            if ! .venv/bin/pip install -r requirements.txt; then
+                if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+                    echo ">> [自愈] 检测到 PyAudio 底层依赖缺失，正在通过 Homebrew 自动安装 portaudio..."
+                    brew install portaudio && .venv/bin/pip install -r requirements.txt
+                fi
+            fi
             PYTHON=".venv/bin/python"
             echo ">> [就绪] 虚拟环境已成功初始化！"
         else
@@ -29,7 +46,7 @@ elif command -v python3 >/dev/null 2>&1; then
         fi
     fi
 else
-    echo ">> [错误] 未检测到 Python3 运行环境，请先安装 Python 3.10+。"
+    echo ">> [错误] 未检测到 Python3 运行环境，请先安装 Python 3.9+。"
     exit 1
 fi
 

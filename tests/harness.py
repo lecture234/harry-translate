@@ -67,6 +67,10 @@ class FastAPITestClient:
         if query_params:
             from urllib.parse import urlencode
             query_string = urlencode(query_params).encode("utf-8")
+        elif "?" in path:
+            path_part, qs = path.split("?", 1)
+            path = path_part
+            query_string = qs.encode("utf-8")
 
         scope = {
             "type": "http",
@@ -198,7 +202,7 @@ class DesktopAppInspector:
 
 
 class ScriptInspector:
-    """Inspects launch and maintenance scripts."""
+    """Inspects launch and rollback scripts."""
     @staticmethod
     def get_content(filename: str) -> Optional[str]:
         path = os.path.join(PROJECT_ROOT, filename)
@@ -230,7 +234,7 @@ class BaseE2ETest(unittest.TestCase):
         elif self.milestone == "M3":
             return os.path.exists(os.path.join(PROJECT_ROOT, "float_app.py"))
         elif self.milestone == "M4":
-            return os.path.exists(os.path.join(PROJECT_ROOT, "start.sh"))
+            return os.path.exists(os.path.join(PROJECT_ROOT, "rollback.sh"))
         elif self.milestone == "M5":
             return True
         return True

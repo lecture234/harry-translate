@@ -43,7 +43,7 @@ from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # Core Audio Pipeline
 from core.audio_pipeline import (
@@ -61,39 +61,29 @@ from engines.qwen_translators import (
     GummyZeroCopyEngine,
     QwenLiveTranslate38Engine,
     TokenBucketLimiter,
+    INPUT_TOKEN_UNIT_PRICE,
+    OUTPUT_TOKEN_UNIT_PRICE,
+    get_token_unit_prices,
 )
 
-# Desktop installs never inherit a developer's .env or API key.
-DESKTOP_MODE = os.getenv("HARRY_DESKTOP") == "1"
-from core.app_paths import data_path
-if not DESKTOP_MODE:
-    load_dotenv()
+# Load .env
+load_dotenv()
 
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if DESKTOP_MODE:
-    ENV_FILE = str(data_path('preferences.env'))
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-if DESKTOP_MODE:
-    DASHSCOPE_API_KEY = ""
-    os.environ.pop("DASHSCOPE_API_KEY", None)
-AUDIO_INPUT_MODE = os.getenv("AUDIO_INPUT_MODE", "meeting")
-if AUDIO_INPUT_MODE not in ("shared_mic", "meeting"):
-    AUDIO_INPUT_MODE = "meeting"
 QWEN_REALTIME_WS_URL = os.getenv(
     "QWEN_REALTIME_WS_URL",
     "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3.8-livetranslate-flash-realtime",
 )
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8000"))
 
-DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE") or os.getenv("ACTIVE_ENGINE")
-if DEFAULT_ENGINE:
-    if "qwen" in DEFAULT_ENGINE.lower():
-        active_engine_type = "qwen3.8-livetranslate-flash-realtime"
-    else:
-        active_engine_type = "gummy-realtime-v1"
-elif "maas.aliyuncs.com" in QWEN_REALTIME_WS_URL:
+DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE") or os.getenv("ACTIVE_ENGINE") or "qwen3.8-livetranslate-flash-realtime"
+if "qwen" in DEFAULT_ENGINE.lower():
     active_engine_type = "qwen3.8-livetranslate-flash-realtime"
 else:
     active_engine_type = "gummy-realtime-v1"
+
 
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 should_run = True
@@ -101,7 +91,7 @@ should_run = True
 # Terminology Management Engine (Milestone 2)
 from core.glossary_manager import get_glossary_manager
 
-glossary_mgr = get_glossary_manager(str(data_path('glossary.json'))) if DESKTOP_MODE else get_glossary_manager()
+glossary_mgr = get_glossary_manager()
 glossary_manager = glossary_mgr
 
 # Client Connection Pools (Strict Physical Channel Decoupling)
@@ -155,7 +145,7 @@ broadcast_parallel = broadcast_to_channel
 # Key Masking & .env Preservation Utilities
 # ---------------------------------------------------------------------------
 def mask_api_key(key: Optional[str]) -> str:
-    """Return a short masked representation that never reveals the full key."""
+    """Mask API key showing prefix and suffix, e.g., sk-38a...9x12."""
     if not key:
         return ""
     k = str(key).strip()
@@ -192,9 +182,10 @@ def set_env_value(key: str, value: str) -> None:
         os.replace(tmp, ENV_FILE)
 
 
-# ---------------------------------------------------------------------------
-# ChannelSession (Dual-Engine Decoupled Channel)
-# ---------------------------------------------------------------------------
+def is_cjk(text: str) -> bool:
+    return any("\u4e00" <= c <= "\u9fff" for c in (text or ""))
+
+
 class ChannelSession:
     """
     Channel session managing translation pipelines, token usage,
@@ -231,6 +222,9 @@ class ChannelSession:
         self.sentence_id = 0
         self.source_text = ""
         self.target_text = ""
+        self.engine_status = {"state": "idle", "detail": ""}
+        self._key_update_lock = threading.Lock()
+        self._latest_api_key: str = DASHSCOPE_API_KEY
 
         # Translation engines
         self.gummy_engine = GummyZeroCopyEngine(
@@ -249,6 +243,8 @@ class ChannelSession:
             api_key=DASHSCOPE_API_KEY,
             ws_url=QWEN_REALTIME_WS_URL,
         )
+        self.gummy_engine.status_fn = self._on_engine_status
+        self.qwen_engine.status_fn = self._on_engine_status
 
         self.active_engine_type = active_engine_type
         if "qwen" in self.active_engine_type.lower():
@@ -259,28 +255,88 @@ class ChannelSession:
         # Inject initial hotwords into cloud engine sessions
         self.sync_hotwords()
 
-    def sync_hotwords(self, hotwords: Optional[List[str]] = None) -> List[str]:
-        """Inject domain hotwords into cloud translation engines."""
+    def _on_engine_status(self, state: str, detail: str = "") -> None:
+        self.engine_status = {"state": state, "detail": detail}
+        payload = {"type": "engine_status", "channel": self.name, "state": state, "detail": detail}
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_to_channel(self.name, payload), main_loop)
+
+    def sync_hotwords(
+        self,
+        hotwords: Optional[Union[List[str], Dict[str, str], str]] = None,
+        corpus_phrases: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        """Inject domain hotwords and structured corpus phrases into cloud translation engines."""
+        explicit_hotwords = hotwords is not None
         if hotwords is None:
             hotwords = glossary_mgr.get_hotwords(channel=self.name)
+        elif isinstance(hotwords, str):
+            s = hotwords.strip()
+            hotwords = [s] if s else []
+
+        if corpus_phrases is None:
+            if isinstance(hotwords, dict):
+                corpus_phrases = dict(hotwords)
+            else:
+                corpus_phrases = glossary_mgr.get_corpus_phrases(
+                    channel=self.name,
+                    target_lang=self.target_lang,
+                    limit=48,
+                )
+
         if hasattr(self.qwen_engine, "live_update_session"):
             try:
                 self.qwen_engine.live_update_session(
-                    self.target_lang, hotwords,
-                    phrases=glossary_mgr.get_cloud_phrases(self.target_lang),
+                    self.target_lang,
+                    hotwords=hotwords if explicit_hotwords else None,
+                    corpus_phrases=corpus_phrases,
                 )
-            except Exception as error:
-                self.qwen_engine._on_ws_error(None, error)
-        elif hasattr(self.qwen_engine, "hotwords"):
-            self.qwen_engine.hotwords = list(hotwords)
+            except Exception:
+                pass
+        if hasattr(self.qwen_engine, "hotwords"):
+            if explicit_hotwords:
+                if isinstance(hotwords, dict):
+                    self.qwen_engine.hotwords = list(hotwords.keys())
+                elif isinstance(hotwords, (list, tuple, set)):
+                    parsed_hw = []
+                    for item in hotwords:
+                        if item is not None:
+                            s = str(item).strip()
+                            if s:
+                                for sep in (":", "->", "="):
+                                    if sep in s:
+                                        s = s.split(sep, 1)[0].strip()
+                                        break
+                                if s:
+                                    parsed_hw.append(s)
+                    self.qwen_engine.hotwords = parsed_hw
+                else:
+                    s = str(hotwords).strip()
+                    for sep in (":", "->", "="):
+                        if sep in s:
+                            s = s.split(sep, 1)[0].strip()
+                            break
+                    self.qwen_engine.hotwords = [s] if s else []
+
         if hasattr(self.gummy_engine, "set_hotwords"):
             try:
-                self.gummy_engine.set_hotwords(hotwords)
+                self.gummy_engine.set_hotwords(hotwords, corpus_phrases=corpus_phrases)
             except Exception:
                 pass
         elif hasattr(self.gummy_engine, "hotwords"):
-            self.gummy_engine.hotwords = list(hotwords)
-        return hotwords
+            if isinstance(hotwords, dict):
+                self.gummy_engine.hotwords = list(hotwords.keys())
+            elif isinstance(hotwords, (list, tuple, set)):
+                self.gummy_engine.hotwords = list(hotwords)
+            else:
+                self.gummy_engine.hotwords = [str(hotwords)]
+
+        if isinstance(hotwords, dict):
+            return list(hotwords.keys())
+        elif isinstance(hotwords, (list, tuple, set)):
+            return list(hotwords)
+        else:
+            return [str(hotwords)]
 
     def _on_engine_emit(self, payload: Dict[str, Any]) -> None:
         sid = payload.get("id", self.sentence_id)
@@ -288,6 +344,7 @@ class ChannelSession:
         tgt = payload.get("target", "")
         is_final = payload.get("is_final", False)
         lat = payload.get("latency_ms", 0)
+        ttft = payload.get("ttft_ms", 0)
 
         with self.state_lock:
             incoming_sid = None
@@ -312,6 +369,7 @@ class ChannelSession:
                 self.target_text = ""
 
             # Token usage calculation
+            in_unit, out_unit = get_token_unit_prices()
             if "usage" in payload and isinstance(payload["usage"], dict):
                 u = payload["usage"]
                 in_tok = u.get("input_tokens", 0)
@@ -320,16 +378,16 @@ class ChannelSession:
                     self.input_tokens += in_tok
                     self.output_tokens += out_tok
                     self.total_tokens += (in_tok + out_tok)
-                    self.cost_rmb = (self.input_tokens * 0.00004) + (self.output_tokens * 0.0001)
+                    self.cost_rmb = (self.input_tokens * in_unit) + (self.output_tokens * out_unit)
             elif is_final and self.total_tokens == 0:
                 in_t = max(1, len(self.source_text) * 2) if self.source_text else 0
                 out_t = max(1, len(self.target_text) * 2) if self.target_text else 0
                 self.input_tokens += in_t
                 self.output_tokens += out_t
                 self.total_tokens += (in_t + out_t)
-                self.cost_rmb = (self.input_tokens * 0.00004) + (self.output_tokens * 0.0001)
+                self.cost_rmb = (self.input_tokens * in_unit) + (self.output_tokens * out_unit)
 
-        self.dispatch(self.sentence_id, self.source_text, self.target_text, is_final, lat)
+        self.dispatch(self.sentence_id, self.source_text, self.target_text, is_final, lat, ttft)
 
     def dispatch(
         self,
@@ -338,8 +396,9 @@ class ChannelSession:
         target: str,
         is_final: bool,
         latency_ms: int = 0,
+        ttft_ms: int = 0,
     ) -> Dict[str, Any]:
-        """Schedule parallel broadcast onto main event loop with glossary sanitization."""
+        """Schedule parallel broadcast onto main event loop with glossary sanitization and symmetric mirror."""
         global main_loop
         clean_source, clean_target = glossary_mgr.apply_fixes(
             source or "", target or "", channel=self.name
@@ -357,6 +416,7 @@ class ChannelSession:
             "target": clean_target,
             "is_final": is_final,
             "latency_ms": latency_ms,
+            "ttft_ms": ttft_ms,
             "usage": {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
@@ -364,9 +424,59 @@ class ChannelSession:
                 "cost_rmb": round(self.cost_rmb, 4),
             },
         }
+
+        # Same-language echo & untranslated source-flash suppression:
+        # 1. channel_zh (en->zh): whenever input speech (clean_source) is Chinese (CJK),
+        #    it is same-language mic echo (even if model echoed Chinese into clean_target).
+        # 2. channel_en (zh->en): whenever input speech (clean_source) is non-CJK (English)
+        #    and clean_target is empty or non-CJK, it is same-language mic echo.
+        # 3. channel_en (zh->en): if clean_source is CJK and clean_target is ALSO pure CJK
+        #    (no ASCII letters, i.e. model momentarily echoed Chinese before translating),
+        #    clear clean_target in broadcast payload so win_en (#activeLine) NEVER flashes Chinese!
+        is_echo = False
+        if self.name == "zh" and is_cjk(clean_source):
+            is_echo = True
+        elif self.name == "en" and clean_source.strip() and not is_cjk(clean_source) and (
+            not clean_target.strip() or not is_cjk(clean_target)
+        ):
+            is_echo = True
+
+        if is_echo:
+            return payload
+
+        pause_ms = getattr(self.qwen_engine, "last_pause_ms", None)
+        if pause_ms is not None:
+            payload["pause_ms"] = pause_ms
+
+        if self.name == "en" and is_cjk(clean_source) and clean_target.strip() and is_cjk(clean_target) and not re.search(r"[A-Za-z]{2,}", clean_target):
+            payload["target"] = ""
+
         if main_loop and main_loop.is_running():
+            # 1. Broadcast to own channel
             asyncio.run_coroutine_threadsafe(
                 broadcast_to_channel(self.name, payload),
+                main_loop,
+            )
+
+            # 2. Symmetrically broadcast mirrored frame to peer channel at WebSocket layer
+            peer_name = "zh" if self.name == "en" else "en"
+            peer_ch = "B" if self.channel_id == "A" else "A"
+            mirrored_id = (100000 + int(sentence_id)) if str(sentence_id).isdigit() else f"100000_{sentence_id}"
+            mirrored_payload = {
+                "type": "sub",
+                "channel": peer_name,
+                "ch": peer_ch,
+                "id": mirrored_id,
+                "source": clean_target,
+                "target": clean_source,
+                "is_final": is_final,
+                "latency_ms": latency_ms,
+                "ttft_ms": ttft_ms,
+                "pause_ms": payload.get("pause_ms"),
+                "usage": payload["usage"],
+            }
+            asyncio.run_coroutine_threadsafe(
+                broadcast_to_channel(peer_name, mirrored_payload),
                 main_loop,
             )
         return payload
@@ -425,35 +535,61 @@ class ChannelSession:
 
     def switch_engine(self, engine_model: str) -> None:
         """Switch active engine between Gummy and Qwen 3.8."""
-        was_running = self.is_ready.is_set()
-        if was_running:
-            self.stop()
+        old_engine = self.active_engine
+        target_engine_type = (
+            "gummy-realtime-v1"
+            if "gummy" in engine_model.lower()
+            else "qwen3.8-livetranslate-flash-realtime"
+        )
+        if target_engine_type == self.active_engine_type and getattr(self.active_engine, "is_running", False):
+            return
+
         if "gummy" in engine_model.lower():
             self.active_engine_type = "gummy-realtime-v1"
             self.active_engine = self.gummy_engine
         else:
             self.active_engine_type = "qwen3.8-livetranslate-flash-realtime"
             self.active_engine = self.qwen_engine
+
+        # Graceful transition: if session is running, stop old engine and start new engine
+        if self.is_ready.is_set() or getattr(old_engine, "is_running", False):
+            if old_engine != self.active_engine and hasattr(old_engine, "stop"):
+                try:
+                    old_engine.stop()
+                except Exception:
+                    pass
+            key = getattr(self.active_engine, "api_key", None) or DASHSCOPE_API_KEY
+            self.active_engine.start(key)
+
         self.sync_hotwords()
-        if was_running:
-            self.start(DASHSCOPE_API_KEY)
 
     def update_api_key(self, new_key: str) -> None:
-        self.stop()
-        self.gummy_engine.api_key = new_key
-        self.qwen_engine.api_key = new_key
-        self.start(new_key)
+        self._latest_api_key = new_key
+        for eng in (self.gummy_engine, self.qwen_engine):
+            eng.api_key = new_key
+            if getattr(eng, "_mock_forced_by_key", False):
+                eng.mock_mode = False
+                eng._mock_forced_by_key = False
+        active = self.active_engine
+        if hasattr(active, "update_api_key"):
+            def _apply_in_background():
+                with self._key_update_lock:
+                    target_key = self._latest_api_key
+                    if hasattr(active, "update_api_key"):
+                        active.update_api_key(target_key)
+
+            threading.Thread(
+                target=_apply_in_background,
+                daemon=True,
+                name=f"KeyApply-{self.name}",
+            ).start()
 
     def set_target_lang(self, new_target: str) -> None:
         with self.state_lock:
             self.target_lang = new_target
-            self.gummy_engine.target_lang = new_target
-        if hasattr(self.qwen_engine, "live_update_session"):
-            hotwords = glossary_mgr.get_hotwords(channel=self.name)
-            self.qwen_engine.live_update_session(
-                target_lang=new_target, hotwords=hotwords,
-                phrases=glossary_mgr.get_cloud_phrases(new_target),
-            )
+            if hasattr(self.gummy_engine, "target_lang"):
+                self.gummy_engine.target_lang = new_target
+        self.sync_hotwords()
 
     def simulate_event(
         self,
@@ -462,6 +598,7 @@ class ChannelSession:
         is_final: bool = False,
         latency_ms: int = 50,
         sentence_id: Optional[int] = None,
+        ttft_ms: int = 0,
     ) -> Dict[str, Any]:
         """Simulation interface for automated test execution."""
         with self.state_lock:
@@ -477,13 +614,15 @@ class ChannelSession:
             sid = self.sentence_id
             self.source_text = source or ""
             self.target_text = target or ""
-        return self.dispatch(sid, source, target, is_final, latency_ms)
+        return self.dispatch(sid, source, target, is_final, latency_ms, ttft_ms)
+
+    emit_mock_sub = simulate_event
 
     def start(self, api_key: Optional[str] = None) -> None:
         key = api_key or DASHSCOPE_API_KEY
         self.sync_hotwords()
-        if self.active_engine.start(key):
-            self.is_ready.set()
+        self.active_engine.start(key)
+        self.is_ready.set()
 
     def stop(self) -> None:
         self.gummy_engine.stop()
@@ -518,16 +657,23 @@ audio_capture_mgr = FastAudioCaptureManager(
     sample_rate=SAMPLE_RATE,
     chunk_size=CHUNK_SIZE,
     on_audio_chunk=handle_audio_chunk,
-    defer_open=DESKTOP_MODE,
 )
 
-# Device indices change when USB/Bluetooth devices are connected. Remember the name.
-preferred_mic = os.getenv("AUDIO_DEVICE_A_NAME", "")
-if preferred_mic and not DESKTOP_MODE:
-    for device in audio_capture_mgr.get_devices().get("devices", []):
-        if device.get("name") == preferred_mic:
-            audio_capture_mgr.set_device(device["index"], channel="A")
-            break
+
+def _on_audio_device_status(state: str, detail: str = "") -> None:
+    """Propagate physical audio device disconnect/recovery status to active HUD channels."""
+    for ch in active_channels:
+        try:
+            ch._on_engine_status(state, detail)
+        except Exception:
+            pass
+
+
+audio_capture_mgr.status_fn = _on_audio_device_status
+
+_client_first_connected_at: float = 0.0
+STARTUP_SUBSCRIPTION_GRACE_SEC: float = 5.0
+
 
 def is_channel_subscribed(channel_key: str) -> bool:
     """
@@ -537,27 +683,36 @@ def is_channel_subscribed(channel_key: str) -> bool:
     returns True to avoid starving unmonitored tests or audio pipelines.
     When only one channel is active (e.g., student in English tutoring only listening to 'zh'),
     audio streaming to the other channel is completely gated, cutting Cloud API token costs by 50%.
+    During client connection startup grace period (5.0s), returns True to prevent startup audio loss.
     """
-    if DESKTOP_MODE and (not app.state.desktop.validated or not app.state.desktop.running):
-        return False
     clients = connected_clients.get(channel_key)
     if clients and len(clients) > 0:
         return True
     all_connected = sum(len(c) for c in connected_clients.values())
-    return all_connected == 0
+    if all_connected == 0:
+        return True
+
+    # Real client connection grace period
+    now = time.time()
+    if _client_first_connected_at > 0 and (now - _client_first_connected_at) < STARTUP_SUBSCRIPTION_GRACE_SEC:
+        return True
+
+    return False
 
 
 # Wire zero-copy physical callbacks with Client-Aware Stream Gating
 def _on_mic_pcm(raw_pcm: bytes) -> None:
     if is_channel_subscribed("en"):
         channel_en.push_audio(raw_pcm)
-    # Explicit shared-microphone mode; never mix meeting audio into the same stream.
-    if AUDIO_INPUT_MODE == "shared_mic":
+    # Smart audio multiplexing: When Channel B has no dedicated virtual loopback soundcard
+    # (standard Mac setup or single-mic test), mirror mic audio to channel_zh as zero-config fallback.
+    # This guarantees that both floating windows (中译英 & 英译中) simultaneously work out of the box!
+    if audio_capture_mgr.worker_b.is_idle:
         if is_channel_subscribed("zh"):
             channel_zh.push_audio(raw_pcm)
 
 def _on_loopback_pcm(raw_pcm: bytes) -> None:
-    if AUDIO_INPUT_MODE == "meeting" and not audio_capture_mgr.worker_b.is_idle:
+    if not audio_capture_mgr.worker_b.is_idle:
         if is_channel_subscribed("zh"):
             channel_zh.push_audio(raw_pcm)
 
@@ -570,8 +725,8 @@ def audio_capture_worker() -> None:
     audio_capture_mgr.start()
 
 
-# HUD click-through and lock state
-hud_lock_state = {"locked": False}
+# HUD click-through and lock state (supports per-window tracking for dual HUD)
+hud_lock_state = {"locked": False, "windows": {"en": False, "zh": False}}
 hud_lock_mutex = threading.Lock()
 
 
@@ -582,20 +737,19 @@ hud_lock_mutex = threading.Lock()
 async def lifespan(app: FastAPI):
     global main_loop
     main_loop = asyncio.get_running_loop()
-    if not DESKTOP_MODE and not audio_capture_mgr.is_running:
+    if not audio_capture_mgr.is_running:
         audio_capture_mgr.start()
     for ch in active_channels:
         ch.switch_engine(active_engine_type)
         ch.sync_hotwords()
-        if not DESKTOP_MODE:
-            ch.start(DASHSCOPE_API_KEY)
+        ch.start(DASHSCOPE_API_KEY)
     print(">> [服务启动] Harry Translate (哈利同传) 双通道极速同传系统已就绪！")
     print(f"   • 当前同传引擎: {active_engine_type}")
-    print("   • 主控面板:    http://localhost:8000/")
-    print("   • 悬浮同传HUD: http://localhost:8000/hud (Zero-install Fallback)")
-    print("   • 中译英大屏:  http://localhost:8000/en  (投屏给外宾看)")
-    print("   • 英译重大屏:  http://localhost:8000/zh  (投屏给中方看)")
-    print("   • 左右双栏屏:  http://localhost:8000/split (现场控台对照)")
+    print(f"   • 主控面板:    http://localhost:{PORT}/")
+    print(f"   • 悬浮同传HUD: http://localhost:{PORT}/hud (Zero-install Fallback)")
+    print(f"   • 中译英大屏:  http://localhost:{PORT}/en  (投屏给外宾看)")
+    print(f"   • 英译重大屏:  http://localhost:{PORT}/zh  (投屏给中方看)")
+    print(f"   • 左右双栏屏:  http://localhost:{PORT}/split (现场控台对照)")
     yield
     audio_capture_mgr.stop()
     for ch in active_channels:
@@ -611,18 +765,14 @@ app = FastAPI(title="Harry Translate 国际会议实时双语同传系统", life
 @app.websocket("/ws/{channel}")
 async def websocket_channel_endpoint(websocket: WebSocket, channel: str):
     """Client connection endpoint for /ws/en and /ws/zh."""
-    if DESKTOP_MODE:
-        from urllib.parse import urlsplit
-        origin = websocket.headers.get('origin', '')
-        if (not app.state.desktop.validated or not app.state.desktop.authenticated(websocket)
-                or (origin and urlsplit(origin).netloc != websocket.headers.get('host'))):
-            await websocket.close(code=1008)
-            return
+    global _client_first_connected_at
     if channel not in connected_clients:
         await websocket.close(code=1003)
         return
 
     await websocket.accept()
+    if sum(len(c) for c in connected_clients.values()) == 0:
+        _client_first_connected_at = time.time()
     connected_clients[channel].add(websocket)
     try:
         while True:
@@ -631,6 +781,10 @@ async def websocket_channel_endpoint(websocket: WebSocket, channel: str):
         connected_clients[channel].discard(websocket)
     except Exception:
         connected_clients[channel].discard(websocket)
+    finally:
+        connected_clients[channel].discard(websocket)
+        if sum(len(c) for c in connected_clients.values()) == 0:
+            _client_first_connected_at = 0.0
 
 
 @app.websocket("/ws")
@@ -642,24 +796,12 @@ async def websocket_default_endpoint(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 # Physical Presentation Routes
 # ---------------------------------------------------------------------------
-def presentation_html(content):
-    if DESKTOP_MODE:
-        content = content.replace('</body>', '<script src="/desktop/controls.js"></script></body>')
-    return HTMLResponse(content=content, media_type="text/html; charset=utf-8")
-
-
 @app.get("/")
 def get_dashboard():
     """Dashboard / Console Monitor."""
     html_path = os.path.join(os.path.dirname(__file__), "index.html")
     with open(html_path, "r", encoding="utf-8") as f:
-        return presentation_html(f.read())
-
-
-@app.get('/assets/meeting-hotwords.js')
-def get_meeting_hotwords_script():
-    from core.app_paths import resource_path
-    return Response(resource_path('meeting-hotwords.js').read_text(encoding='utf-8'), media_type='text/javascript')
+        return HTMLResponse(content=f.read(), media_type="text/html; charset=utf-8")
 
 
 @app.get("/en")
@@ -667,7 +809,7 @@ def get_en_screen():
     """Dedicated English Display Screen (Channel A)."""
     html_path = os.path.join(os.path.dirname(__file__), "index.html")
     with open(html_path, "r", encoding="utf-8") as f:
-        return presentation_html(f.read())
+        return HTMLResponse(content=f.read(), media_type="text/html; charset=utf-8")
 
 
 @app.get("/zh")
@@ -675,7 +817,7 @@ def get_zh_screen():
     """Dedicated Chinese Display Screen (Channel B)."""
     html_path = os.path.join(os.path.dirname(__file__), "index.html")
     with open(html_path, "r", encoding="utf-8") as f:
-        return presentation_html(f.read())
+        return HTMLResponse(content=f.read(), media_type="text/html; charset=utf-8")
 
 
 @app.get("/split")
@@ -683,7 +825,7 @@ def get_split_screen():
     """Dual-Column Monitor Screen with Config Drawer."""
     html_path = os.path.join(os.path.dirname(__file__), "index.html")
     with open(html_path, "r", encoding="utf-8") as f:
-        return presentation_html(f.read())
+        return HTMLResponse(content=f.read(), media_type="text/html; charset=utf-8")
 
 
 @app.get("/hud")
@@ -749,14 +891,6 @@ def get_meta():
     return JSONResponse(content={
         "status": "ok",
         "system_status": "online",
-        "audio_input_mode": AUDIO_INPUT_MODE,
-        "cloud_status": {ch.name: {
-            "ready": ch.active_engine.is_ready.is_set() and not ch.active_engine.mock_mode,
-            "error": getattr(ch.active_engine, "last_error", ""),
-            "corpus_status": getattr(ch.active_engine, "corpus_status", "unsupported"),
-            "cloud_phrases_count": len(getattr(ch.active_engine, "cloud_phrases", {})),
-        } for ch in active_channels},
-        "microphone_frames": audio_capture_mgr.worker_a.total_frames_captured,
         "active_engine": active_engine_type,
         "engine_type": active_engine_type,
         "engine_model": active_engine_type,
@@ -779,12 +913,17 @@ def get_meta():
             },
             "channel_b": {
                 "name": channel_zh.name,
-                "device": devices_info.get("channel_a_device" if AUDIO_INPUT_MODE == "shared_mic" else "channel_b_device"),
-                "is_idle": audio_capture_mgr.worker_a.is_idle if AUDIO_INPUT_MODE == "shared_mic" else devices_info.get("channel_b_idle", False),
-                "is_loopback": AUDIO_INPUT_MODE == "meeting",
+                "device": devices_info.get("channel_b_device"),
+                "is_idle": devices_info.get("channel_b_idle", False),
+                "is_loopback": True,
                 "target_lang": channel_zh.target_lang,
                 "label": channel_zh.label,
             },
+        },
+        "api_key_configured": bool(masked_key),
+        "engine_status": {
+            "en": channel_en.engine_status,
+            "zh": channel_zh.engine_status,
         },
     })
 
@@ -796,7 +935,6 @@ def get_config():
     devices_info = audio_capture_mgr.get_devices()
     return JSONResponse(content={
         "status": "ok",
-        "audio_input_mode": AUDIO_INPUT_MODE,
         "engine_model": active_engine_type,
         "active_engine": active_engine_type,
         "api_key_masked": masked_key,
@@ -806,6 +944,11 @@ def get_config():
         "channel_b_idle": devices_info.get("channel_b_idle", False),
         "target_lang_a": channel_en.target_lang,
         "target_lang_b": channel_zh.target_lang,
+        "api_key_configured": bool(masked_key),
+        "engine_status": {
+            "en": channel_en.engine_status,
+            "zh": channel_zh.engine_status,
+        },
     })
 
 
@@ -815,7 +958,7 @@ async def post_config(request: Request):
     Dynamic partial configuration update.
     CRITICAL: Submitting an empty or whitespace API key MUST NEVER overwrite an existing key in .env!
     """
-    global DASHSCOPE_API_KEY, active_engine_type, AUDIO_INPUT_MODE
+    global DASHSCOPE_API_KEY, active_engine_type
     try:
         body = await request.json()
     except Exception:
@@ -823,15 +966,7 @@ async def post_config(request: Request):
     if not isinstance(body, dict):
         body = {}
 
-    mode = body.get("audio_input_mode")
-    if mode is not None and mode not in ("shared_mic", "meeting"):
-        return JSONResponse(status_code=400, content={"status": "error", "message": "无效的音频输入模式"})
-
     updated: Dict[str, Any] = {}
-    if mode is not None:
-        AUDIO_INPUT_MODE = mode
-        set_env_value("AUDIO_INPUT_MODE", mode)
-        updated["audio_input_mode"] = mode
 
     # 1. API Key handling (CRITICAL: Never overwrite with empty/whitespace!)
     api_key = body.get("api_key")
@@ -861,8 +996,6 @@ async def post_config(request: Request):
         try:
             res_a = audio_capture_mgr.set_device(int(dev_a), channel="A")
             updated["channel_a"] = res_a
-            if res_a.get("status") == "ok":
-                set_env_value("AUDIO_DEVICE_A_NAME", audio_capture_mgr.worker_a.device_name)
         except Exception as e:
             updated["channel_a_error"] = str(e)
 
@@ -889,7 +1022,6 @@ async def post_config(request: Request):
             active_engine_type = "qwen3.8-livetranslate-flash-realtime"
         for ch in active_channels:
             ch.switch_engine(active_engine_type)
-        set_env_value("DEFAULT_ENGINE", active_engine_type)
         updated["engine_model"] = active_engine_type
 
     # 5. Language switches
@@ -919,9 +1051,18 @@ async def post_config(request: Request):
 # Audio Device Management Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/api/audio/devices")
-def get_audio_devices():
+def get_audio_devices(refresh: Optional[str] = None):
     """Get all available audio input devices (microphones & virtual loopbacks)."""
-    devices_info = audio_capture_mgr.get_devices()
+    should_refresh = str(refresh or "").strip().lower() in ("1", "true", "yes")
+    if should_refresh:
+        try:
+            devices_info = audio_capture_mgr.get_devices(refresh=True)
+        except TypeError:
+            if hasattr(audio_capture_mgr, "_device_cache"):
+                audio_capture_mgr._device_cache.clear()
+            devices_info = audio_capture_mgr.get_devices()
+    else:
+        devices_info = audio_capture_mgr.get_devices()
     return JSONResponse(content=devices_info)
 
 
@@ -976,36 +1117,99 @@ async def set_audio_device(request: Request, device_index: Optional[int] = None)
 # HUD Lock & Click-Through Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/api/hud/lock")
-def get_hud_lock(locked: Optional[bool] = None):
-    """Query or toggle HUD click-through status."""
+def get_hud_lock(locked: Optional[bool] = None, window_id: Optional[str] = None, channel: Optional[str] = None):
+    """Query or toggle HUD click-through status (supports per-window and global queries)."""
+    wid = window_id or channel
     with hud_lock_mutex:
+        if "windows" not in hud_lock_state:
+            hud_lock_state["windows"] = {"en": False, "zh": False}
+
         if locked is not None:
-            hud_lock_state["locked"] = bool(locked)
-        return JSONResponse(content={"status": "ok", "locked": hud_lock_state["locked"]})
+            b_locked = bool(locked)
+            if wid:
+                hud_lock_state["windows"][wid] = b_locked
+                hud_lock_state["locked"] = any(hud_lock_state["windows"].values())
+            else:
+                hud_lock_state["locked"] = b_locked
+                for k in list(hud_lock_state["windows"].keys()):
+                    hud_lock_state["windows"][k] = b_locked
+
+        content = {
+            "status": "ok",
+            "locked": hud_lock_state["locked"],
+            "windows": dict(hud_lock_state["windows"])
+        }
+        if wid:
+            content["window_id"] = wid
+            content["window_locked"] = hud_lock_state["windows"].get(wid, False)
+        return JSONResponse(content=content)
 
 
 @app.post("/api/hud/lock")
-async def post_hud_lock(request: Request, locked: Optional[bool] = None):
-    """Set HUD click-through status (supports JSON or query params)."""
+async def post_hud_lock(request: Request, locked: Optional[bool] = None, window_id: Optional[str] = None, channel: Optional[str] = None):
+    """Set HUD click-through status (supports JSON or query params, per-window or global)."""
     target_locked = locked
+    wid = window_id or channel
     if target_locked is None and "locked" in request.query_params:
         target_locked = request.query_params.get("locked")
+    if wid is None and "window_id" in request.query_params:
+        wid = request.query_params.get("window_id")
+    if wid is None and "channel" in request.query_params:
+        wid = request.query_params.get("channel")
 
-    if target_locked is None:
+    if target_locked is None or wid is None:
         try:
             body = await request.json()
             if isinstance(body, dict):
-                target_locked = body.get("locked")
+                if target_locked is None:
+                    target_locked = body.get("locked")
+                if wid is None:
+                    wid = body.get("window_id") or body.get("channel")
         except Exception:
             pass
 
     with hud_lock_mutex:
+        if "windows" not in hud_lock_state:
+            hud_lock_state["windows"] = {"en": False, "zh": False}
+
         if target_locked is not None:
             if isinstance(target_locked, str):
-                hud_lock_state["locked"] = target_locked.lower() in ("true", "1", "yes")
+                b_locked = target_locked.lower() in ("true", "1", "yes")
             else:
-                hud_lock_state["locked"] = bool(target_locked)
-        return JSONResponse(content={"status": "ok", "locked": hud_lock_state["locked"]})
+                b_locked = bool(target_locked)
+
+            if wid:
+                hud_lock_state["windows"][wid] = b_locked
+                hud_lock_state["locked"] = any(hud_lock_state["windows"].values())
+            else:
+                hud_lock_state["locked"] = b_locked
+                for k in list(hud_lock_state["windows"].keys()):
+                    hud_lock_state["windows"][k] = b_locked
+
+        content = {
+            "status": "ok",
+            "locked": hud_lock_state["locked"],
+            "windows": dict(hud_lock_state["windows"])
+        }
+        if wid:
+            content["window_id"] = wid
+            content["window_locked"] = hud_lock_state["windows"].get(wid, False)
+
+        ws_payload = {
+            "type": "hud_lock",
+            "locked": hud_lock_state["locked"],
+            "windows": dict(hud_lock_state["windows"]),
+        }
+        if wid:
+            ws_payload["window_id"] = wid
+            ws_payload["channel"] = wid
+        try:
+            for ch in ["en", "zh", "all", "hud"]:
+                asyncio.create_task(broadcast_to_channel(ch, ws_payload))
+        except Exception:
+            pass
+
+        return JSONResponse(content=content)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,16 +1248,17 @@ def reset_stats():
 
 
 # ---------------------------------------------------------------------------
-# Specialized Terminology & Dynamic Glossary Hot-Reload Endpoints (Milestone 2)
+# Specialized Terminology & Dynamic Glossary Hot-Reload Endpoints (Milestones 1 & 2)
 # ---------------------------------------------------------------------------
 @app.get("/api/glossary")
 def get_glossary():
     """
-    Query active terminology dictionary, metadata, and term statistics.
-    Returns {"status": "ok", "terms_count": int, "data": {...}}.
+    Query active terminology dictionary, metadata, quota status, and session terms.
+    Returns backward-compatible keys along with quota and categories breakdown.
     """
     meta = glossary_mgr.get_meta()
     data = glossary_mgr.to_dict()
+    quota = glossary_mgr.get_quota_status()
     terms_count = meta.get("counts", {}).get("total_terms", 0)
     return JSONResponse(content={
         "status": "ok",
@@ -1064,6 +1269,11 @@ def get_glossary():
         "description": meta.get("description", ""),
         "data": data,
         "glossary": data,
+        "quota": quota,
+        "categories": quota.get("categories", []),
+        "session_terms": meta.get("session_terms", {}),
+        "session_terms_count": quota.get("session_terms_count", 0),
+        "permanent_terms_count": quota.get("permanent_terms_count", 0),
     })
 
 
@@ -1071,10 +1281,11 @@ def get_glossary():
 @app.post("/api/glossary/reload")
 async def post_glossary(request: Request):
     """
-    Dynamic atomic hot-reload for terminology dictionary in <= 5ms (AC-G4).
-    Accepts JSON glossary body, invokes reload(persist=True), and dynamically
-    reconnects changed Qwen sessions to inject the updated translation phrase mappings.
-    Returns {"status": "ok", "reload_ms": float, "terms_count": int}.
+    Unified glossary mutation endpoint supporting:
+    1. Legacy full glossary JSON reload (in <= 5ms)
+    2. Batch text import (batch_text with multi-delimiters =, ->, =>, :, ：)
+    3. Single term add (source, target, category, is_session)
+    Dynamically pushes updated hotwords to active channel sessions.
     """
     t0 = time.perf_counter()
     payload = {}
@@ -1087,12 +1298,21 @@ async def post_glossary(request: Request):
     if not isinstance(payload, dict):
         payload = {}
 
-    try:
+    is_session = bool(payload.get("is_session", False))
+
+    if "batch_text" in payload:
+        batch_text = str(payload.get("batch_text", ""))
+        default_cat = str(payload.get("category", "terms_zh_to_en"))
+        res = glossary_mgr.import_batch_text(batch_text, default_category=default_cat, is_session=is_session)
+    elif "source" in payload and "target" in payload:
+        src = str(payload.get("source", ""))
+        tgt = str(payload.get("target", ""))
+        cat = str(payload.get("category", "terms_zh_to_en"))
+        glossary_mgr.add_term(src, tgt, category=cat, is_session=is_session)
+        res = {"status": "ok", "added": src, "is_session": is_session}
+    else:
         reload_res = glossary_mgr.reload(new_data=payload, persist=True)
-    except ValueError as error:
-        return JSONResponse(status_code=400, content={"status": "error", "message": str(error)})
-    except OSError:
-        return JSONResponse(status_code=500, content={"status": "error", "message": "词库保存失败，请检查磁盘空间和写入权限。"})
+        res = reload_res
 
     # Dynamically trigger hotwords update on active channel sessions without restarting server
     for ch in active_channels:
@@ -1101,31 +1321,193 @@ async def post_glossary(request: Request):
         except Exception:
             pass
 
-    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-    terms_count = reload_res.get("counts", {}).get("total_terms", 0)
+    measured_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    elapsed_ms = float(res.get("reload_ms", measured_ms))
+    meta = glossary_mgr.get_meta()
+    terms_count = meta.get("counts", {}).get("total_terms", 0)
+    quota = glossary_mgr.get_quota_status()
 
     return JSONResponse(content={
         "status": "ok",
-        "message": "Glossary reloaded successfully",
+        "message": "Glossary updated successfully",
         "reload_ms": elapsed_ms,
         "reload_time_ms": elapsed_ms,
         "terms_count": terms_count,
         "total_terms": terms_count,
-        "counts": reload_res.get("counts", {}),
-        "revision": glossary_mgr.to_dict().get('_revision', 0),
+        "counts": meta.get("counts", {}),
+        "quota": quota,
+        "details": res,
+    })
+
+
+@app.post("/api/glossary/session/clear")
+async def post_glossary_session_clear():
+    """Clear temporary session words with 0 disk writes and sync active channels."""
+    cleared_count = glossary_mgr.clear_session()
+    for ch in active_channels:
+        try:
+            ch.sync_hotwords()
+        except Exception:
+            pass
+    return JSONResponse(content={
+        "status": "ok",
+        "cleared_count": cleared_count,
+        "message": f"Cleared {cleared_count} session terms with 0 disk writes",
+        "quota": glossary_mgr.get_quota_status(),
+    })
+
+
+@app.post("/api/glossary/session/promote")
+async def post_glossary_session_promote():
+    """Promote temporary session words into permanent dictionary, write to disk, and sync."""
+    promoted_count = glossary_mgr.promote_session()
+    for ch in active_channels:
+        try:
+            ch.sync_hotwords()
+        except Exception:
+            pass
+    return JSONResponse(content={
+        "status": "ok",
+        "promoted_count": promoted_count,
+        "message": f"Promoted {promoted_count} session terms to permanent dictionary",
+        "quota": glossary_mgr.get_quota_status(),
+    })
+
+
+@app.post("/api/glossary/toggle_pack")
+async def post_glossary_toggle_pack(request: Request):
+    """Toggle a category pack's enabled state and sync hotwords."""
+    payload = {}
+    try:
+        raw_body = await request.body()
+        if raw_body:
+            payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        pass
+    if not isinstance(payload, dict):
+        payload = {}
+
+    pack_id = str(payload.get("pack_id", ""))
+    enabled = bool(payload.get("enabled", True))
+
+    success = glossary_mgr.toggle_pack(pack_id, enabled)
+    if success:
+        for ch in active_channels:
+            try:
+                ch.sync_hotwords()
+            except Exception:
+                pass
+
+    return JSONResponse(content={
+        "status": "ok" if success else "error",
+        "pack_id": pack_id,
+        "enabled": enabled if success else (not enabled),
+        "message": "Pack toggled successfully" if success else "Cannot toggle pack (locked or invalid)",
+        "quota": glossary_mgr.get_quota_status(),
+    })
+
+
+@app.post("/api/glossary/delete")
+async def post_glossary_delete(request: Request):
+    """Delete a specific term from session or permanent storage."""
+    payload = {}
+    try:
+        raw_body = await request.body()
+        if raw_body:
+            payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        pass
+    if not isinstance(payload, dict):
+        payload = {}
+
+    key = str(payload.get("key", payload.get("source", "")))
+    cat = str(payload.get("category", "terms_zh_to_en"))
+    is_session = payload.get("is_session")
+    if is_session is not None:
+        is_session = bool(is_session)
+
+    success = glossary_mgr.delete_term(key, category=cat, is_session=is_session)
+    if success:
+        for ch in active_channels:
+            try:
+                ch.sync_hotwords()
+            except Exception:
+                pass
+
+    return JSONResponse(content={
+        "status": "ok" if success else "error",
+        "deleted": key,
+        "quota": glossary_mgr.get_quota_status(),
     })
 
 
 @app.get("/api/glossary/hotwords")
 def get_glossary_hotwords(channel: str = "zh"):
-    """Get active domain hotwords list."""
+    """Get active domain hotwords list capped at safe threshold (<= 900 terms)."""
     hotwords = glossary_mgr.get_hotwords(channel=channel)
+    quota = glossary_mgr.get_quota_status()
     return JSONResponse(content={
         "status": "ok",
         "channel": channel,
         "count": len(hotwords),
         "hotwords": hotwords,
+        "quota": quota,
     })
+
+
+@app.get("/api/glossary/terms/active")
+def get_active_glossary_terms(
+    category: str = "terms_zh_to_en",
+    scope: str = "all",
+    q: Optional[str] = None,
+    search: Optional[str] = None,
+    deduplicate: bool = False,
+):
+    """Retrieve active terminology records across P0, P1, P2, and P3."""
+    search_query = q if q is not None else search
+    terms = glossary_mgr.get_active_terms(
+        category=category,
+        scope=scope,
+        search=search_query,
+        deduplicate=deduplicate,
+    )
+    return JSONResponse(content={
+        "status": "ok",
+        "category": category,
+        "scope": scope,
+        "count": len(terms),
+        "total_active_terms": len(terms),
+        "terms": terms,
+        "quota": glossary_mgr.get_quota_status(),
+    })
+
+
+@app.post("/api/glossary/check_conflict")
+async def post_glossary_check_conflict(request: Request):
+    """Check conflict status for proposed term mapping against all active terms."""
+    payload = {}
+    try:
+        raw = await request.body()
+        if raw:
+            payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        pass
+    if not isinstance(payload, dict):
+        payload = {}
+
+    chinese = str(payload.get("chinese", payload.get("source", "")))
+    target = str(payload.get("target", ""))
+    cat = str(payload.get("category", "terms_zh_to_en"))
+    is_session = bool(payload.get("is_session", True))
+    proposed_priority = str(payload.get("proposed_priority", "P0" if is_session else "P1"))
+
+    result = glossary_mgr.check_conflict(
+        chinese=chinese,
+        target=target,
+        category=cat,
+        proposed_priority=proposed_priority,
+    )
+    return JSONResponse(content=result)
 
 
 # ---------------------------------------------------------------------------
@@ -1133,12 +1515,8 @@ def get_glossary_hotwords(channel: str = "zh"):
 # ---------------------------------------------------------------------------
 def main():
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1" if DESKTOP_MODE else "0.0.0.0", port=8000, log_level="warning")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
 
-
-if DESKTOP_MODE:
-    from core.desktop_service import install_desktop_routes
-    install_desktop_routes(app, sys.modules[__name__])
 
 if __name__ == "__main__":
     main()
